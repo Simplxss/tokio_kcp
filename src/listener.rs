@@ -8,7 +8,7 @@ use std::{
 
 use byte_string::ByteStr;
 use kcp::{Error as KcpError, KcpResult};
-use log::{debug, error, trace};
+use log::{error, trace};
 use tokio::{
     net::{ToSocketAddrs, UdpSocket},
     sync::mpsc,
@@ -16,13 +16,20 @@ use tokio::{
     time,
 };
 
-use crate::{config::KcpConfig, session::KcpSessionManager, stream::KcpStream};
+use crate::{
+    config::KcpConfig,
+    control::{self, ControlSegment},
+    session::{KcpSession, KcpSessionManager},
+    skcp::KcpSocket,
+    stream::KcpStream,
+};
 
 #[derive(Debug)]
 pub struct KcpListener {
     udp: Arc<UdpSocket>,
     accept_rx: mpsc::Receiver<(KcpStream, SocketAddr)>,
     task_watcher: JoinHandle<()>,
+    pub sessions: KcpSessionManager,
 }
 
 impl Drop for KcpListener {
@@ -44,75 +51,92 @@ impl KcpListener {
         let server_udp = udp.clone();
 
         let (accept_tx, accept_rx) = mpsc::channel(1024 /* backlogs */);
+
+        let sessions = KcpSessionManager::new();
+        // KcpSessionManager has Arc internally
+        let sessions_clone = sessions.clone();
+
         let task_watcher = tokio::spawn(async move {
             let (close_tx, mut close_rx) = mpsc::channel(64);
 
-            let mut sessions = KcpSessionManager::new();
             let mut packet_buffer = [0u8; 65536];
             loop {
                 tokio::select! {
                     peer_addr = close_rx.recv() => {
                         let peer_addr = peer_addr.expect("close_tx closed unexpectedly");
-                        sessions.close_peer(peer_addr);
+                        sessions_clone.remove(peer_addr);
                         trace!("session peer_addr: {} removed", peer_addr);
                     }
 
-                    recv_res = udp.recv_from(&mut packet_buffer) => {
+                    recv_res = server_udp.recv_from(&mut packet_buffer) => {
                         match recv_res {
                             Err(err) => {
                                 error!("udp.recv_from failed, error: {}", err);
                                 time::sleep(Duration::from_secs(1)).await;
                             }
                             Ok((n, peer_addr)) => {
-                                let packet = &mut packet_buffer[..n];
+                                let packet_buffer = &packet_buffer[..n];
 
-                                trace!("received peer: {}, {:?}", peer_addr, ByteStr::new(packet));
-
-                                if packet.len() < kcp::KCP_OVERHEAD {
-                                    error!("packet too short, received {} bytes, but at least {} bytes",
-                                           packet.len(),
-                                           kcp::KCP_OVERHEAD);
+                                if n == 20 {
+                                    let control_segment = ControlSegment::decode(packet_buffer);
+                                    match control_segment.cmd {
+                                        0xff => {
+                                            let conv = sessions_clone.alloc_conv();
+                                            let token = rand::random();
+                                            let socket = match KcpSocket::new(&config, conv, token, server_udp.clone(), peer_addr, config.stream){
+                                                Ok(socket) => socket,
+                                                Err(err) => {
+                                                    error!("KcpSocket::new failed, error: {}", err);
+                                                    continue;
+                                                }
+                                            };
+                                            let session = KcpSession::new_shared(socket, config.session_expire, Some((close_tx.clone(), conv)));
+                                            sessions_clone.insert(conv, session.clone());
+                                            accept_tx.send((KcpStream::with_session(session), peer_addr)).await.unwrap();
+                                            let response_packet = control::build_handshake_response(conv, token);
+                                            if let Err(err) = server_udp.send_to(&response_packet, peer_addr).await {
+                                                error!("udp.send_to failed, error: {}", err);
+                                            }
+                                        }
+                                        0x194 => {
+                                            let conv = control_segment.conv;
+                                            let token = control_segment.token;
+                                            let session = match sessions_clone.get(conv).await {
+                                                Some(s) => s,
+                                                None => {
+                                                    error!("get session failed, peer: {}, conv: {}, token: {}", peer_addr, conv, token);
+                                                    continue;
+                                                }
+                                            };
+                                            if session.token() != token {
+                                                error!("token not match, peer: {}, conv: {}, token: {}, session token: {}", peer_addr, conv, token, session.token());
+                                                continue;
+                                            }
+                                            sessions_clone.remove(conv);
+                                        }
+                                        _ => {
+                                            error!("invalid control segment cmd: {}", control_segment.cmd);
+                                        }
+                                    }
                                     continue;
                                 }
 
-                                let mut conv = kcp::get_conv(packet);
-                                if conv == 0 {
-                                    // Allocate a conv for client.
-                                    conv = sessions.alloc_conv();
-                                    debug!("allocate {} conv for peer: {}", conv, peer_addr);
-
-                                    kcp::set_conv(packet, conv);
+                                if n < kcp::KCP_OVERHEAD {
+                                    error!("packet too short, received {} bytes, but at least {} bytes",
+                                            n,
+                                            kcp::KCP_OVERHEAD);
+                                    continue;
                                 }
 
-                                let sn = kcp::get_sn(packet);
+                                let conv = kcp::get_conv(packet_buffer);
+                                let token = kcp::get_token(packet_buffer);
 
-                                let session = match sessions.get_or_create(&config, conv, sn, &udp, peer_addr, &close_tx).await {
-                                    Ok((s, created)) => {
-                                        if created {
-                                            // Created a new session, constructed a new accepted client
-                                            let stream = KcpStream::with_session(s.clone());
-                                            if  accept_tx.try_send((stream, peer_addr)).is_err() {
-                                                debug!("failed to create accepted stream due to channel failure");
+                                trace!("received peer: {}, conv: {}, token: {}, {:?}", peer_addr, conv, token, ByteStr::new(packet_buffer));
 
-                                                // remove it from session
-                                                sessions.close_peer(peer_addr);
-                                                continue;
-                                            }
-                                        } else {
-                                            let session_conv = s.conv().await;
-                                            if session_conv != conv {
-                                                debug!("received peer: {} with conv: {} not match with session conv: {}",
-                                                       peer_addr,
-                                                       conv,
-                                                       session_conv);
-                                                continue;
-                                            }
-                                        }
-
-                                        s
-                                    },
-                                    Err(err) => {
-                                        error!("failed to create session, error: {}, peer: {}, conv: {}", err, peer_addr, conv);
+                                let session = match sessions_clone.get(conv).await {
+                                    Some(s) => s,
+                                    None => {
+                                        error!("get session failed, peer: {}, conv: {}, token: {}", peer_addr, conv, token);
                                         continue;
                                     }
                                 };
@@ -121,7 +145,7 @@ impl KcpListener {
                                 // if let Err(err) = kcp.input(packet) {
                                 //     error!("kcp.input failed, peer: {}, conv: {}, error: {}, packet: {:?}", peer_addr, conv, err, ByteStr::new(packet));
                                 // }
-                                if session.input(packet).await.is_err() {
+                                if session.input(packet_buffer).await.is_err() {
                                     trace!("[SESSION] KCP session is closing while listener tries to input");
                                 }
                             }
@@ -132,9 +156,10 @@ impl KcpListener {
         });
 
         Ok(KcpListener {
-            udp: server_udp,
+            udp,
             accept_rx,
             task_watcher,
+            sessions,
         })
     }
 
@@ -151,8 +176,9 @@ impl KcpListener {
 
     pub fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<KcpResult<(KcpStream, SocketAddr)>> {
         self.accept_rx.poll_recv(cx).map(|op_res| {
-            op_res
-                .ok_or_else(|| KcpError::IoError(io::Error::new(ErrorKind::Other, "accept channel closed unexpectedly")))
+            op_res.ok_or_else(|| {
+                KcpError::IoError(io::Error::new(ErrorKind::Other, "accept channel closed unexpectedly"))
+            })
         })
     }
 

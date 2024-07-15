@@ -3,6 +3,7 @@
 pub use self::{
     config::{KcpConfig, KcpNoDelayConfig},
     listener::KcpListener,
+    session::KcpSessionManager,
     stream::KcpStream,
 };
 
@@ -12,3 +13,4 @@ mod session;
 mod skcp;
 mod stream;
 mod utils;
+mod control;

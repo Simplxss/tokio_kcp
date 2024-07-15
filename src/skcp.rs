@@ -73,9 +73,9 @@ pub struct KcpSocket {
     socket: Arc<UdpSocket>,
     flush_write: bool,
     flush_ack_input: bool,
-    sent_first: bool,
     pending_sender: Option<Waker>,
     pending_receiver: Option<Waker>,
+    established: bool,
     closed: bool,
     allow_recv_empty_packet: bool,
 }
@@ -84,22 +84,18 @@ impl KcpSocket {
     pub fn new(
         c: &KcpConfig,
         conv: u32,
+        token: u32,
         socket: Arc<UdpSocket>,
         target_addr: SocketAddr,
         stream: bool,
     ) -> KcpResult<KcpSocket> {
         let output = UdpOutput::new(socket.clone(), target_addr);
         let mut kcp = if stream {
-            Kcp::new_stream(conv, output)
+            Kcp::new_stream(conv, token, output)
         } else {
-            Kcp::new(conv, output)
+            Kcp::new(conv, token, output)
         };
         c.apply_config(&mut kcp);
-
-        // Ask server to allocate one
-        if conv == 0 {
-            kcp.input_conv();
-        }
 
         kcp.update(now_millis())?;
 
@@ -109,9 +105,9 @@ impl KcpSocket {
             socket,
             flush_write: c.flush_write,
             flush_ack_input: c.flush_acks_input,
-            sent_first: false,
             pending_sender: None,
             pending_receiver: None,
+            established: false,
             closed: false,
             allow_recv_empty_packet: c.allow_recv_empty_packet,
         })
@@ -123,6 +119,10 @@ impl KcpSocket {
             Ok(..) => {}
             Err(KcpError::ConvInconsistent(expected, actual)) => {
                 trace!("[INPUT] Conv expected={} actual={} ignored", expected, actual);
+                return Ok(false);
+            }
+            Err(KcpError::TokenInconsistent(expected, actual)) => {
+                trace!("[INPUT] Token expected={} actual={} ignored", expected, actual);
                 return Ok(false);
             }
             Err(err) => return Err(err),
@@ -145,17 +145,16 @@ impl KcpSocket {
         // If:
         //     1. Have sent the first packet (asking for conv)
         //     2. Too many pending packets
-        if self.sent_first
+        if !self.established
             && (self.kcp.wait_snd() >= self.kcp.snd_wnd() as usize
-                || self.kcp.wait_snd() >= self.kcp.rmt_wnd() as usize
-                || self.kcp.waiting_conv())
+                || self.kcp.wait_snd() >= self.kcp.rmt_wnd() as usize)
         {
             trace!(
-                "[SEND] waitsnd={} sndwnd={} rmtwnd={} excceeded or waiting conv={}",
+                "[SEND] established={} waitsnd={} sndwnd={} rmtwnd={}",
+                self.established,
                 self.kcp.wait_snd(),
                 self.kcp.snd_wnd(),
-                self.kcp.rmt_wnd(),
-                self.kcp.waiting_conv()
+                self.kcp.rmt_wnd()
             );
 
             if let Some(waker) = self.pending_sender.replace(cx.waker().clone()) {
@@ -166,12 +165,11 @@ impl KcpSocket {
             return Poll::Pending;
         }
 
-        if !self.sent_first && self.kcp.waiting_conv() && buf.len() > self.kcp.mss() {
+        if buf.len() > self.kcp.mss() {
             buf = &buf[..self.kcp.mss()];
         }
 
         let n = self.kcp.send(buf)?;
-        self.sent_first = true;
 
         if self.kcp.wait_snd() >= self.kcp.snd_wnd() as usize || self.kcp.wait_snd() >= self.kcp.rmt_wnd() as usize {
             self.kcp.flush()?;
@@ -252,10 +250,10 @@ impl KcpSocket {
     fn try_wake_pending_waker(&mut self) -> bool {
         let mut waked = false;
 
-        if self.pending_sender.is_some()
+        if self.established
+            && self.pending_sender.is_some()
             && self.kcp.wait_snd() < self.kcp.snd_wnd() as usize
             && self.kcp.wait_snd() < self.kcp.rmt_wnd() as usize
-            && !self.kcp.waiting_conv()
         {
             let waker = self.pending_sender.take().unwrap();
             waker.wake();
@@ -313,8 +311,20 @@ impl KcpSocket {
         self.kcp.set_conv(conv);
     }
 
-    pub fn waiting_conv(&self) -> bool {
-        self.kcp.waiting_conv()
+    pub fn token(&self) -> u32 {
+        self.kcp.token()
+    }
+
+    pub fn set_token(&mut self, token: u32) {
+        self.kcp.set_token(token);
+    }
+
+    pub fn established(&self) -> bool {
+        self.established
+    }
+
+    pub fn set_established(&mut self, established: bool) {
+        self.established = established;
     }
 
     pub fn peek_size(&self) -> KcpResult<usize> {
@@ -327,7 +337,7 @@ impl KcpSocket {
 
     pub fn need_flush(&self) -> bool {
         (self.kcp.wait_snd() >= self.kcp.snd_wnd() as usize || self.kcp.wait_snd() >= self.kcp.rmt_wnd() as usize)
-            && !self.kcp.waiting_conv()
+            && self.established
     }
 }
 
@@ -350,8 +360,6 @@ mod test {
     async fn kcp_echo() {
         let _ = env_logger::try_init();
 
-        static CONV: u32 = 0xdeadbeef;
-
         // s1 connects s2
         let s1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let s2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -363,8 +371,10 @@ mod test {
         let s2 = Arc::new(s2);
 
         let config = KcpConfig::default();
-        let kcp1 = KcpSocket::new(&config, 0, s1.clone(), s2_addr, true).unwrap();
-        let kcp2 = KcpSocket::new(&config, CONV, s2.clone(), s1_addr, true).unwrap();
+        let conv = 114514;
+        let token = 1919810;
+        let kcp1 = KcpSocket::new(&config, conv, token, s1.clone(), s2_addr, true).unwrap();
+        let kcp2 = KcpSocket::new(&config, conv, token, s2.clone(), s1_addr, true).unwrap();
 
         let kcp1 = Arc::new(Mutex::new(kcp1));
         let kcp2 = Arc::new(Mutex::new(kcp2));
@@ -407,11 +417,6 @@ mod test {
                 let n = s2.recv(&mut buf).await.unwrap();
 
                 let packet = &mut buf[..n];
-
-                let conv = kcp::get_conv(packet);
-                if conv == 0 {
-                    kcp::set_conv(packet, CONV);
-                }
 
                 let mut kcp2 = kcp2.lock().await;
                 kcp2.input(packet).unwrap();

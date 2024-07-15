@@ -7,15 +7,21 @@ use std::{
     task::{Context, Poll},
 };
 
+use byte_string::ByteStr;
 use futures_util::{future, ready};
 use kcp::{Error as KcpError, KcpResult};
-use log::trace;
+use log::{error, trace};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::UdpSocket,
 };
 
-use crate::{config::KcpConfig, session::KcpSession, skcp::KcpSocket};
+use crate::{
+    config::KcpConfig,
+    control::{self, ControlSegment},
+    session::KcpSession,
+    skcp::KcpSocket,
+};
 
 pub struct KcpStream {
     session: Arc<KcpSession>,
@@ -50,46 +56,102 @@ impl KcpStream {
             IpAddr::V4(..) => UdpSocket::bind("0.0.0.0:0").await?,
             IpAddr::V6(..) => UdpSocket::bind("[::]:0").await?,
         };
+        udp.connect(addr).await?;
 
         KcpStream::connect_with_socket(config, udp, addr).await
-    }
-
-    /// Create a `KcpStream` connecting to `addr`
-    ///
-    /// `conv` is the conversation identifier, setting to `0` will let server to randomly generate one for you.
-    pub async fn connect_with_conv(config: &KcpConfig, conv: u32, addr: SocketAddr) -> KcpResult<KcpStream> {
-        let udp = match addr.ip() {
-            IpAddr::V4(..) => UdpSocket::bind("0.0.0.0:0").await?,
-            IpAddr::V6(..) => UdpSocket::bind("[::]:0").await?,
-        };
-
-        KcpStream::connect_with_socket_conv(config, conv, udp, addr).await
     }
 
     /// Create a `KcpStream` with an existed `UdpSocket` connecting to `addr`
     ///
     /// NOTE: `conv` will be randomly generated
     pub async fn connect_with_socket(config: &KcpConfig, udp: UdpSocket, addr: SocketAddr) -> KcpResult<KcpStream> {
-        let mut conv = rand::random();
-        while conv == 0 {
-            conv = rand::random();
-        }
-        KcpStream::connect_with_socket_conv(config, conv, udp, addr).await
-    }
-
-    /// Create a `KcpStream` with an existed `UdpSocket` connecting to `addr`
-    ///
-    /// `conv` is the conversation identifier, setting to `0` will let server to randomly generate one for you.
-    pub async fn connect_with_socket_conv(
-        config: &KcpConfig,
-        conv: u32,
-        udp: UdpSocket,
-        addr: SocketAddr,
-    ) -> KcpResult<KcpStream> {
         let udp = Arc::new(udp);
-        let socket = KcpSocket::new(config, conv, udp, addr, config.stream)?;
+        let server_udp = udp.clone();
 
+        let socket = KcpSocket::new(config, 0, 0, udp, addr, config.stream)?;
         let session = KcpSession::new_shared(socket, config.session_expire, None);
+
+        {
+            let session = session.clone();
+
+            server_udp.send(&control::build_handshake_request()).await.unwrap();
+            tokio::spawn(async move {
+                let mut input_buffer = [0u8; 65536];
+
+                loop {
+                    // recv() then input()
+                    // Drives the KCP machine forward
+                    match server_udp.recv(&mut input_buffer).await {
+                        Err(err) => {
+                            error!("[SESSION] UDP recv failed, error: {}", err);
+                        }
+                        Ok(n) => {
+                            let input_buffer = &input_buffer[..n];
+
+                            if n == 20 {
+                                let control_segment = ControlSegment::decode(input_buffer);
+                                match control_segment.cmd {
+                                    0x145 => {
+                                        let mut socket = session.kcp_socket().lock();
+                                        socket.set_conv(control_segment.conv);
+                                        socket.set_token(control_segment.token);
+                                        socket.set_established(true);
+                                        continue;
+                                    }
+                                    0x194 => {
+                                        let socket = session.kcp_socket().lock();
+                                        server_udp
+                                            .send(&control::build_disconnect_response(socket.conv(), socket.token()))
+                                            .await
+                                            .unwrap();
+                                        break;
+                                    }
+                                    _ => {
+                                        error!(
+                                            "[SESSION] UDP recv {} bytes, unknown control segment {:?}",
+                                            n, control_segment
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            if n < kcp::KCP_OVERHEAD {
+                                error!(
+                                    "packet too short, received {} bytes, but at least {} bytes",
+                                    n,
+                                    kcp::KCP_OVERHEAD
+                                );
+                                continue;
+                            }
+
+                            let input_conv = kcp::get_conv(input_buffer);
+                            let input_token = kcp::get_token(input_buffer);
+                            trace!(
+                                "[SESSION] UDP recv {} bytes, conv: {}, token: {}, going to input {:?}",
+                                n,
+                                input_conv,
+                                input_token,
+                                ByteStr::new(input_buffer)
+                            );
+
+                            match session.input(input_buffer).await {
+                                Ok(()) => {
+                                    trace!("[SESSION] UDP input {} bytes and waked sender/receiver", n);
+                                }
+                                Err(_) => {
+                                    error!(
+                                        "[SESSION] UDP input {}, input buffer {:?}",
+                                        n,
+                                        ByteStr::new(input_buffer)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        };
 
         Ok(KcpStream::with_session(session))
     }
