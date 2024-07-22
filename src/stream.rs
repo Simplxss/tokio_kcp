@@ -104,6 +104,7 @@ impl KcpStream {
                                             .send(&control::build_disconnect_response(socket.conv(), socket.token()))
                                             .await
                                             .unwrap();
+                                        session.close();
                                         break;
                                     }
                                     _ => {

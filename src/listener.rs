@@ -137,14 +137,13 @@ impl KcpListener {
                                     Some(s) => s,
                                     None => {
                                         error!("get session failed, peer: {}, conv: {}, token: {}", peer_addr, conv, token);
+
+                                        let response_packet = control::build_disconnect_request(conv, token, 0);
+                                        let _ = server_udp.send_to(&response_packet, peer_addr).await;
                                         continue;
                                     }
                                 };
 
-                                // let mut kcp = session.kcp_socket().lock().await;
-                                // if let Err(err) = kcp.input(packet) {
-                                //     error!("kcp.input failed, peer: {}, conv: {}, error: {}, packet: {:?}", peer_addr, conv, err, ByteStr::new(packet));
-                                // }
                                 if session.input(packet_buffer).await.is_err() {
                                     trace!("[SESSION] KCP session is closing while listener tries to input");
                                 }

@@ -145,9 +145,9 @@ impl KcpSocket {
         // If:
         //     1. Have sent the first packet (asking for conv)
         //     2. Too many pending packets
-        if !self.established
-            && (self.kcp.wait_snd() >= self.kcp.snd_wnd() as usize
-                || self.kcp.wait_snd() >= self.kcp.rmt_wnd() as usize)
+        if self.kcp.wait_snd() >= self.kcp.snd_wnd() as usize
+            || self.kcp.wait_snd() >= self.kcp.rmt_wnd() as usize
+            || !self.established
         {
             trace!(
                 "[SEND] established={} waitsnd={} sndwnd={} rmtwnd={}",

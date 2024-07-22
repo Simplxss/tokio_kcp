@@ -239,7 +239,12 @@ impl KcpSessionManager {
 
     #[inline]
     pub fn alloc_conv(&self) -> u32 {
-        rand::random()
+        loop {
+            let conv = rand::random();
+            if !self.sessions.contains_key(&conv) {
+                return conv;
+            }
+        }
     }
 
     pub fn remove(&self, conv: u32) {
